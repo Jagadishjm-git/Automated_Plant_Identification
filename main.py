@@ -67,6 +67,7 @@ NVIDIA_API_KEY = os.environ.get("NVIDIA_API_KEY", DEFAULT_NVIDIA_KEY).strip()
 NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_TEXT_MODEL = "meta/llama-3.1-8b-instruct"
 NVIDIA_VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", "")).strip()
 
 # =====================================================
 # CLEAN TEXT & FAKE WORD / GIBBERISH CHECKER
@@ -123,7 +124,92 @@ def is_fake_or_invalid_plant_query(text):
 # STRICT BOTANICAL VISION AI PREDICTION ENGINE
 # =====================================================
 
+def query_gemini_vision_ai(image_b64, mime_type="image/jpeg", text_prompt=""):
+    """
+    Analyzes uploaded plant photo using Google Gemini Multimodal Vision API.
+    Used whenever GEMINI_API_KEY / GOOGLE_API_KEY is available.
+    """
+    key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", "")).strip()
+    if not key:
+        return None
+
+    vision_system_instruction = (
+        "You are an expert botanical computer vision model. "
+        "Analyze the provided image and decide if it depicts a real plant, tree, flower, herb, leaf, fruit, or botanical organism. "
+        "Respond strictly in valid JSON format with keys: "
+        "\"Is_Plant\": boolean, \"Common_Name\": string or null, \"Scientific_Name\": string or null, "
+        "\"Family\": string or null, \"Plant_Type\": string or null, \"Habitat\": string or null, "
+        "\"Medicinal_Uses\": string or null, \"Culinary_Uses\": string or null, \"Industrial_Uses\": string or null, "
+        "\"Leaf_Shape\": string or null, \"Flower_Color\": string or null, \"Smell\": string or null, "
+        "\"Toxicity\": string or null, \"Match_Percentage\": integer 0-100, \"Ai_Explanation\": string, \"Message\": string or null."
+    )
+
+    prompt_content = f"User description provided with photo: '{text_prompt}'" if text_prompt else "Identify this plant from the photo."
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": f"{vision_system_instruction}\n\nTask: {prompt_content}"},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64
+                        }
+                    }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1024,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    # Try gemini-1.5-flash then gemini-1.5-pro
+    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+    ssl_ctx = ssl.create_default_context()
+
+    for mod in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={key}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=18, context=ssl_ctx) as response:
+                res_data = response.read().decode("utf-8")
+                res_json = json.loads(res_data)
+                candidates = res_json.get("candidates", [])
+                if not candidates:
+                    continue
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts:
+                    continue
+                content_text = parts[0].get("text", "")
+                content_text = re.sub(r"^```json\s*", "", content_text.strip())
+                content_text = re.sub(r"\s*```$", "", content_text.strip())
+                result_dict = json.loads(content_text)
+
+                if result_dict.get("Is_Plant") is True:
+                    result_dict["Is_Vision_Ai"] = True
+                    result_dict["Vision_Provider"] = f"Gemini ({mod})"
+                    if not result_dict.get("Match_Percentage"):
+                        result_dict["Match_Percentage"] = 95
+                return result_dict
+        except Exception as e:
+            print(f"[GEMINI VISION] Model {mod} error: {e}")
+            continue
+
+    return None
+
+
 def query_nvidia_vision_ai(image_b64, mime_type="image/jpeg", text_prompt=""):
+    """
+    Fallback botanical vision AI using NVIDIA NIM API.
+    """
     if not NVIDIA_API_KEY:
         return None
 
@@ -185,12 +271,33 @@ def query_nvidia_vision_ai(image_b64, mime_type="image/jpeg", text_prompt=""):
             
             if result_dict.get("Is_Plant") is True:
                 result_dict["Is_Vision_Ai"] = True
+                result_dict["Vision_Provider"] = "NVIDIA NIM"
                 if not result_dict.get("Match_Percentage"):
                     result_dict["Match_Percentage"] = 95
             return result_dict
     except Exception as e:
         print("NVIDIA Vision AI Timeout / Exception:", e)
         return None
+
+
+def analyze_plant_photo_with_ai(image_b64, mime_type="image/jpeg", text_prompt=""):
+    """
+    Unified multimodal vision engine:
+    1. First tries Google Gemini Multimodal Vision API (if GEMINI_API_KEY / GOOGLE_API_KEY set)
+    2. Falls back to NVIDIA NIM Vision AI
+    3. Returns structured botanical JSON or None
+    """
+    # 1. Try Gemini Vision first
+    gemini_res = query_gemini_vision_ai(image_b64, mime_type=mime_type, text_prompt=text_prompt)
+    if gemini_res:
+        return gemini_res
+
+    # 2. Try NVIDIA NIM Vision
+    nvidia_res = query_nvidia_vision_ai(image_b64, mime_type=mime_type, text_prompt=text_prompt)
+    if nvidia_res:
+        return nvidia_res
+
+    return None
 
 # =====================================================
 # PUBLIC LANDING & AUTHENTICATION ROUTES
@@ -318,7 +425,7 @@ def department_dashboard():
                     mime = f"image/{'jpeg' if ext in ['jpg', 'jpeg'] else ext}"
                     uploaded_image_url = f"data:{mime};base64,{b64_data}"
                     
-                    vision_result = query_nvidia_vision_ai(b64_data, mime_type=mime, text_prompt=user_text)
+                    vision_result = analyze_plant_photo_with_ai(b64_data, mime_type=mime, text_prompt=user_text)
                     
                     if vision_result and vision_result.get("Is_Plant") is False:
                         not_plant_error = vision_result.get("Message", "No plant or botanical subject detected in this photo.")
@@ -423,7 +530,7 @@ def api_predict():
         
         if image_b64:
             mime = data.get("mime_type", "image/jpeg")
-            vis_res = query_nvidia_vision_ai(image_b64, mime_type=mime, text_prompt=text)
+            vis_res = analyze_plant_photo_with_ai(image_b64, mime_type=mime, text_prompt=text)
             if vis_res and vis_res.get("Is_Plant") is False:
                 return jsonify({"is_plant": False, "error": vis_res.get("Message")}), 200
             elif vis_res and vis_res.get("Common_Name"):
