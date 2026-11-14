@@ -167,8 +167,13 @@ def query_gemini_vision_ai(image_b64, mime_type="image/jpeg", text_prompt=""):
         }
     }
 
-    # Try gemini-1.5-flash then gemini-1.5-pro
-    models_to_try = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"]
+    # Active Google Gemini Multimodal Vision models (gemini-3.5-flash-lite, gemini-3.8-flash)
+    models_to_try = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-latest"
+    ]
     ssl_ctx = ssl.create_default_context()
 
     for mod in models_to_try:
