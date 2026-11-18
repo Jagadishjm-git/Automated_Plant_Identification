@@ -304,6 +304,86 @@ def analyze_plant_photo_with_ai(image_b64, mime_type="image/jpeg", text_prompt="
 
     return None
 
+
+def query_gemini_text_identification(user_text):
+    """
+    Fallback botanical analysis using Google Gemini when user's description
+    does not yield confident matches in the local dataset.
+    """
+    key = GEMINI_API_KEY or os.environ.get("GEMINI_API_KEY", os.environ.get("GOOGLE_API_KEY", "")).strip()
+    if not key or not user_text:
+        return None
+
+    system_prompt = (
+        "You are an expert botanical taxonomist. Given the user plant description, determine whether it describes a real botanical plant or tree. "
+        "Respond strictly in valid JSON format with keys: "
+        "\"Is_Plant\": boolean, \"Common_Name\": string or null, \"Scientific_Name\": string or null, "
+        "\"Family\": string or null, \"Plant_Type\": string or null, \"Habitat\": string or null, "
+        "\"Medicinal_Uses\": string or null, \"Culinary_Uses\": string or null, \"Industrial_Uses\": string or null, "
+        "\"Leaf_Shape\": string or null, \"Flower_Color\": string or null, \"Smell\": string or null, "
+        "\"Toxicity\": string or null, \"Match_Percentage\": integer 0-100, \"Ai_Explanation\": string, \"Message\": string or null."
+    )
+
+    models_to_try = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+        "gemini-flash-latest"
+    ]
+    ssl_ctx = ssl.create_default_context()
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": f"{system_prompt}\n\nUser Description: {user_text}"}
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 1024,
+            "responseMimeType": "application/json"
+        }
+    }
+
+    for mod in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{mod}:generateContent?key={key}"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=18, context=ssl_ctx) as response:
+                res_data = response.read().decode("utf-8")
+                res_json = json.loads(res_data)
+                candidates = res_json.get("candidates", [])
+                if not candidates:
+                    continue
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts:
+                    continue
+                content_text = parts[0].get("text", "")
+                content_text = re.sub(r"^```json\s*", "", content_text.strip())
+                content_text = re.sub(r"\s*```$", "", content_text.strip())
+                result_dict = json.loads(content_text)
+
+                if result_dict.get("Is_Plant") is True and result_dict.get("Common_Name"):
+                    result_dict["Is_Vision_Ai"] = False
+                    result_dict["Is_Gemini_Fallback"] = True
+                    result_dict["Detection_Source"] = f"Gemini Intelligence ({mod})"
+                    if not result_dict.get("Match_Percentage"):
+                        result_dict["Match_Percentage"] = 92
+                    return result_dict
+                elif result_dict.get("Is_Plant") is False:
+                    return result_dict
+        except Exception as e:
+            print(f"[GEMINI TEXT FALLBACK] Model {mod} error: {e}")
+            continue
+
+    return None
+
 # =====================================================
 # PUBLIC LANDING & AUTHENTICATION ROUTES
 # =====================================================
@@ -453,14 +533,22 @@ def department_dashboard():
                                 if results:
                                     db.record_audit_log(f"{current_dept['department_code']} identified {results[0].get('Common_Name')} via multimodal input", department_id=current_dept["id"], department_code=current_dept["department_code"], ip_address=get_client_ip())
                             else:
-                                not_plant_error = pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")
+                                # Fallback to Gemini text identification if dataset was uncertain
+                                gemini_text_res = query_gemini_text_identification(user_text)
+                                if gemini_text_res and gemini_text_res.get("Is_Plant") and gemini_text_res.get("Common_Name"):
+                                    gemini_text_res["Photo_Url"] = uploaded_image_url
+                                    gemini_text_res["Is_Verified_Image"] = False
+                                    results.append(gemini_text_res)
+                                    db.record_audit_log(f"{current_dept['department_code']} identified {gemini_text_res.get('Common_Name')} via Gemini text fallback", department_id=current_dept["id"], department_code=current_dept["department_code"], ip_address=get_client_ip())
+                                else:
+                                    not_plant_error = pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")
                         else:
                             not_plant_error = "Vision AI could not identify the plant. Please add a text description to help identification."
                 except Exception as ex:
                     print("File Upload Error:", ex)
                     not_plant_error = "Unable to process uploaded image file. Please try a different image format (JPG/PNG)."
             
-            # 2. Text / Voice Input Only (Dataset-First Pipeline)
+            # 2. Text / Voice Input Only (Dataset-First Pipeline with Gemini Fallback)
             elif user_text:
                 if is_fake_or_invalid_plant_query(user_text):
                     not_plant_error = "The input text is invalid, fake, or does not describe botanical plant features."
@@ -475,7 +563,15 @@ def department_dashboard():
                         first_match = results[0].get("Common_Name") if results else "Plant"
                         db.record_audit_log(f"{current_dept['department_code']} identified {first_match}", department_id=current_dept["id"], department_code=current_dept["department_code"], ip_address=get_client_ip())
                     else:
-                        not_plant_error = pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")
+                        # Fallback to Gemini AI if not detected in the dataset
+                        gemini_text_res = query_gemini_text_identification(user_text)
+                        if gemini_text_res and gemini_text_res.get("Is_Plant") and gemini_text_res.get("Common_Name"):
+                            results.append(gemini_text_res)
+                            db.record_audit_log(f"{current_dept['department_code']} identified {gemini_text_res.get('Common_Name')} via Gemini text fallback", department_id=current_dept["id"], department_code=current_dept["department_code"], ip_address=get_client_ip())
+                        elif gemini_text_res and gemini_text_res.get("Is_Plant") is False:
+                            not_plant_error = gemini_text_res.get("Message", "The description does not appear to describe a real plant or botanical subject.")
+                        else:
+                            not_plant_error = pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")
 
         return render_template("index.html", results=results[:5], user_text=user_text, uploaded_image_url=uploaded_image_url, not_plant_error=not_plant_error, candidates_debug=candidates_debug, current_dept=current_dept)
     except Exception as general_ex:
@@ -549,12 +645,18 @@ def api_predict():
                 return jsonify({"is_plant": False, "status": "UNCERTAIN", "error": "The input text is invalid, fake, or does not describe botanical plant features."}), 200
 
             pipeline_res = execute_plant_identification_pipeline(text)
-            if not pipeline_res.get("is_plant") and not results:
-                return jsonify({"is_plant": False, "status": "UNCERTAIN", "error": pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")}), 200
-            
-            if pipeline_res.get("is_plant"):
+            if pipeline_res.get("is_plant") and pipeline_res.get("results"):
                 for item in pipeline_res.get("results", []):
                     results.append(item)
+            elif not results:
+                # Fallback to Gemini if dataset did not detect plant
+                gemini_text_res = query_gemini_text_identification(text)
+                if gemini_text_res and gemini_text_res.get("Is_Plant") and gemini_text_res.get("Common_Name"):
+                    results.append(gemini_text_res)
+                elif gemini_text_res and gemini_text_res.get("Is_Plant") is False:
+                    return jsonify({"is_plant": False, "status": "UNCERTAIN", "error": gemini_text_res.get("Message", "The description does not appear to describe a real plant.")}), 200
+                else:
+                    return jsonify({"is_plant": False, "status": "UNCERTAIN", "error": pipeline_res.get("message", "Plant identification is uncertain. Please provide more botanical characteristics.")}), 200
 
         if not results:
             return jsonify({"is_plant": False, "status": "UNCERTAIN", "error": "Plant identification is uncertain. Please provide more botanical characteristics."}), 200
